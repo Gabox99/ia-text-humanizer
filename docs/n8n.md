@@ -256,7 +256,9 @@ Errors come back as `{"detail": "..."}`, except `422`, where FastAPI makes `deta
 
 | Status | Meaning | What to do |
 |---|---|---|
+| `400` | Server key missing/rejected, or Anthropic rejected the request | Read `detail`; check `/health` for `anthropic_key_configured` |
 | `401` | Bad or missing `X-API-Key` | Check the header name and the env var |
+| `402` | Anthropic account has no credit balance | Add credits at console.anthropic.com -> Plans & Billing |
 | `422` | Body failed validation | Read `detail[].msg`; usually an empty `text` or a non-`claude-*` model |
 | `429` | Anthropic rate limit | Honour the `Retry-After` header; lower `CONCURRENCY` |
 | `502` | No key configured, key rejected, or Anthropic errored | Check `/health` for `anthropic_key_configured`; the `detail` says which |

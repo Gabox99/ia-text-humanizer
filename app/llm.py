@@ -137,6 +137,14 @@ class Rewriter:
                     beta=True,
                 )
             except anthropic.BadRequestError as exc:
+                # Only a beta/parameter rejection means "this account can't use
+                # the fallback" — disable it and retry plain. A billing or other
+                # account-level 400 is not about the beta: re-raise it so the
+                # endpoint surfaces the real cause, and don't waste a second call
+                # or permanently disable fallback over it.
+                message = (getattr(exc, "message", None) or str(exc)).lower()
+                if "credit balance" in message or "billing" in message:
+                    raise
                 log.warning(
                     "Server-side refusal fallback rejected (%s); continuing without it.",
                     exc,

@@ -100,9 +100,14 @@ async def humanize(
     started = time.monotonic()
     try:
         result = await pipeline.run(req)
+    # Error mapping rule: anything the operator must act on (missing key, bad key,
+    # empty credit balance, malformed request) is surfaced as a 4xx, because
+    # reverse proxies — EasyPanel/Traefik included — replace 5xx (especially
+    # 502/503/504) with their own "service unreachable" page and swallow our
+    # message. Only a genuine upstream outage or network failure stays 5xx.
     except MissingCredentials as exc:
         raise HTTPException(
-            status_code=502,
+            status_code=400,
             detail=(
                 "ANTHROPIC_API_KEY is not configured on the server. "
                 "Check GET /health -> anthropic_key_configured."
@@ -112,7 +117,8 @@ async def humanize(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except anthropic.AuthenticationError as exc:
         raise HTTPException(
-            status_code=502, detail="Anthropic rejected the API key"
+            status_code=400,
+            detail="Anthropic rejected the API key. Check the ANTHROPIC_API_KEY env var.",
         ) from exc
     except anthropic.RateLimitError as exc:
         retry_after = exc.response.headers.get("retry-after", "60")
@@ -121,7 +127,24 @@ async def humanize(
             detail=f"Anthropic rate limit reached; retry after {retry_after}s",
             headers={"Retry-After": retry_after},
         ) from exc
+    except anthropic.BadRequestError as exc:
+        # A 400 from Anthropic is a request/account problem, not a gateway fault.
+        # The most common one in practice is an empty credit balance.
+        message = getattr(exc, "message", None) or str(exc)
+        low_balance = (
+            "credit balance is too low" in message.lower() or "billing" in message.lower()
+        )
+        raise HTTPException(
+            status_code=402 if low_balance else 400,
+            detail=(
+                "Anthropic account has no credit balance. Add credits at "
+                "console.anthropic.com -> Plans & Billing."
+                if low_balance
+                else f"Anthropic rejected the request: {message}"
+            ),
+        ) from exc
     except anthropic.APIStatusError as exc:
+        # Genuine upstream 5xx. Rare and transient; retry is the fix.
         raise HTTPException(
             status_code=502, detail=f"Anthropic API error ({exc.status_code}): {exc.message}"
         ) from exc
