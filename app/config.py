@@ -50,6 +50,32 @@ class Settings(BaseSettings):
     # Full pipeline passes. Overrides the count implied by `strength` when set.
     # Capped at 3: more passes mostly add cost and fact-drift risk.
     passes: int = 0  # 0 = derive from strength
+
+    # --- Guidance detector -------------------------------------------------
+    # The optimisation target for the adversarial pass. "local" runs a real
+    # neural detector on CPU and is the only setting that meaningfully moves
+    # trained classifiers (GPTZero, Copyleaks); "none" falls back to the
+    # stylometric proxy, which does not.
+    #   local | none
+    guidance_detector: str = "local"
+    # Must be trained on modern LLM output. A GPT-2-era detector teaches the
+    # pipeline nothing about current model prose.
+    guidance_model: str = "desklib/ai-text-detector-v1.01"
+    guidance_batch_size: int = 16
+    guidance_threads: int = 0  # 0 = let torch decide
+    # Load the weights at startup rather than on the first request.
+    guidance_warmup: bool = False
+
+    # --- Adversarial pass --------------------------------------------------
+    # Detector-guided sentence substitution, run after the rewrite passes.
+    enable_adversarial: bool = True
+    adversarial_rounds: int = 3
+    adversarial_candidates: int = 4
+    adversarial_sentences_per_round: int = 12
+    # Stop once the guidance detector is at or below this probability (0-1).
+    adversarial_target_probability: float = 0.25
+    # Only substitute sentences the detector is at least this suspicious of.
+    adversarial_min_sentence_probability: float = 0.35
     # Words per chunk sent to the model. Smaller chunks give the model more
     # attention per sentence; larger chunks give it more rhythmic context.
     chunk_target_words: int = 700

@@ -21,12 +21,15 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from app.config import Settings
+from app.html_bridge import html_to_markdown, looks_like_html, markdown_to_html
 from app.llm import PRICING, ModelRefusal, Rewriter, Usage
 from app.prompts import builder
 from app.rules.postprocess import postprocess
 from app.schemas import (
+    AdversarialReport,
     ChunkTrace,
     HumanizeRequest,
     HumanizeResponse,
@@ -44,6 +47,9 @@ from app.structure import (
     parse_blocks,
     validate_rewrite,
 )
+
+if TYPE_CHECKING:
+    from app.adversarial import AdversarialResult
 
 log = logging.getLogger(__name__)
 
@@ -320,6 +326,7 @@ class Pipeline:
 
     async def run(self, req: HumanizeRequest) -> HumanizeResponse:
         settings = self.settings
+        warnings_pre: list[str] = []
         strength = (req.strength or settings.strength or "standard").lower()
         if strength not in {"standard", "aggressive", "max"}:
             strength = "standard"
@@ -335,7 +342,28 @@ class Pipeline:
         model = req.model or settings.model
         pack = metrics.pack_for(req.language)
 
+        # --- input format -------------------------------------------------
+        # CMS payloads arrive as HTML, often with double-encoded newlines. Both
+        # are converted to Markdown here and converted back at the end, because
+        # every downstream stage — block parsing, sentence splitting, the
+        # detector — reads raw tags as prose and gets the structure wrong.
         source = req.text.strip()
+        output_format = (req.format or "auto").lower()
+        html_doc = None
+        if output_format == "html" or (output_format == "auto" and looks_like_html(source)):
+            html_doc = html_to_markdown(source)
+            source = html_doc.markdown
+            output_format = "html"
+            if html_doc.had_literal_newlines:
+                warnings_pre.append(
+                    "input contained literal \\n sequences rather than real newlines "
+                    "(double-encoded JSON); they were converted."
+                )
+            if not source.strip():
+                raise ValueError("no text content found after parsing the HTML input")
+        else:
+            output_format = "markdown"
+
         injected_title = False
         # A title supplied out-of-band still needs humanizing, so it rides
         # through the pipeline as an H1 and is lifted back out at the end.
@@ -351,7 +379,7 @@ class Pipeline:
         )
 
         usage = Usage()
-        warnings: list[str] = []
+        warnings: list[str] = list(warnings_pre)
         trajectory: list[float] = []
         last_results: list[ChunkResult] = []
         current = source
@@ -371,6 +399,25 @@ class Pipeline:
             _, pass_score, _ = metrics.analyse(mask_verbatim(current).text, req.language)
             trajectory.append(pass_score.value)
 
+        # --- adversarial pass ---------------------------------------------
+        # Everything above optimises a hand-crafted surface proxy. This is the
+        # stage that optimises a real detector, and it is the only one that
+        # moves trained classifiers. Sentence-for-sentence substitution inside
+        # paragraphs, so it cannot damage the structure the passes above built.
+        adversarial = None
+        if self._adversarial_enabled(req):
+            adversarial = await self._run_adversarial(current, req, model)
+            if adversarial:
+                current = adversarial.markdown
+                usage.add(adversarial.usage)
+                warnings.extend(adversarial.warnings)
+                if not adversarial.neural:
+                    warnings.append(
+                        "adversarial pass ran against the stylometric proxy, not a neural "
+                        "detector. Set GUIDANCE_DETECTOR=local for this stage to affect "
+                        "trained classifiers such as GPTZero or Copyleaks."
+                    )
+
         if model not in PRICING:
             warnings.append(
                 f"no published price on file for '{model}'; estimated_cost_usd is billed at "
@@ -379,6 +426,10 @@ class Pipeline:
 
         title, content = self._split_title(current, req, injected_title)
         measured_after, score_after, _ = metrics.analyse(content, req.language)
+        if output_format == "html":
+            # Scored as Markdown above (prose, not tags), then rendered back to
+            # the format the caller sent.
+            content = markdown_to_html(content, html_doc.frozen if html_doc else {})
 
         return HumanizeResponse(
             title=title,
@@ -389,8 +440,22 @@ class Pipeline:
             target_ai_score=target,
             target_met=score_after.value <= target,
             strength=strength,
+            format=output_format,
             passes_run=passes,
             score_trajectory=[round(v, 2) for v in trajectory],
+            adversarial=(
+                AdversarialReport(
+                    detector=adversarial.detector,
+                    neural=adversarial.neural,
+                    ai_probability_before=round(adversarial.probability_before, 4),
+                    ai_probability_after=round(adversarial.probability_after, 4),
+                    rounds_run=adversarial.rounds_run,
+                    substitutions=adversarial.substitutions,
+                    trajectory=adversarial.trajectory,
+                )
+                if adversarial
+                else None
+            ),
             chunks=[r.trace for r in last_results],
             usage=UsageReport(
                 input_tokens=usage.input_tokens,
@@ -403,6 +468,41 @@ class Pipeline:
             model=model,
             warnings=warnings,
         )
+
+    def _adversarial_enabled(self, req: HumanizeRequest) -> bool:
+        if req.adversarial is not None:
+            return req.adversarial
+        return self.settings.enable_adversarial
+
+    async def _run_adversarial(
+        self, markdown: str, req: HumanizeRequest, model: str
+    ) -> "AdversarialResult | None":
+        from app.adversarial import AdversarialRefiner
+        from app.detector import get_detector
+
+        s = self.settings
+        try:
+            detector = get_detector(s)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.error("guidance detector unavailable, skipping adversarial pass: %s", exc)
+            return None
+
+        refiner = AdversarialRefiner(
+            detector=detector,
+            rewriter=self.rewriter,
+            rounds=req.adversarial_rounds or s.adversarial_rounds,
+            candidates=s.adversarial_candidates,
+            sentences_per_round=s.adversarial_sentences_per_round,
+            target_probability=(
+                req.adversarial_target
+                if req.adversarial_target is not None
+                else s.adversarial_target_probability
+            ),
+            min_sentence_probability=s.adversarial_min_sentence_probability,
+            model=req.model,
+            effort=req.effort,
+        )
+        return await refiner.refine(markdown, req.language)
 
     def _resolve_passes(self, req: HumanizeRequest, strength: str) -> int:
         """How many full passes to run. Explicit request wins, else per strength."""

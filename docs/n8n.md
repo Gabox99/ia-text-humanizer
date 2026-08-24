@@ -95,6 +95,48 @@ otherwise land inside your first heading.
 
 ---
 
+## 2b. `POST /detect` — what the guidance detector thinks
+
+This is the neural detector the adversarial pass optimises against, exposed directly. No
+Anthropic call, so it costs nothing, but it does need the detector-enabled image.
+
+```bash
+curl -s -X POST "$HUMANIZER_URL/detect" \
+  -H "X-API-Key: $APP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Your article text here...","limit":8}'
+```
+
+```json
+{
+  "detector": "desklib/ai-text-detector-v1.01",
+  "neural": true,
+  "ai_probability": 0.7648,
+  "ai_percent": 76.48,
+  "verdict": "ai",
+  "words": 123,
+  "sentences": [
+    {"ai_probability": 0.9284, "text": "Judgment is everything else."},
+    {"ai_probability": 0.8562, "text": "What matters more is that this is a public stress test."}
+  ]
+}
+```
+
+**Check `neural` first.** If it is `false`, the stylometric proxy answered and the numbers
+are not detector scores — set `GUIDANCE_DETECTOR=local` on an image built with
+`WITH_DETECTOR=true`.
+
+**The check that decides whether any of this works:** paste text your real detector
+flagged. If `/detect` reports a low probability on text GPTZero calls 100% AI, the two
+disagree and the adversarial pass is optimising a target your detector does not share.
+Pick a different `GUIDANCE_MODEL` — `scripts/detector_check.py` compares candidates
+side by side.
+
+The `sentences` array is also the most useful debugging output in the service: it shows
+exactly which sentences carry the machine signal, which is what the pass rewrites first.
+
+---
+
 ## 3. `POST /humanize` — the real thing
 
 ### Minimal
@@ -164,6 +206,37 @@ curl -s -X POST "$HUMANIZER_URL/humanize" \
 **Honest expectation:** higher strength helps most against perplexity/burstiness checkers (ZeroGPT, QuillBot). Against trained classifiers (Copyleaks, and TruthScan/Undetectable) the gain is modest — those detect a model fingerprint that surface rewriting cannot fully remove. `max` also **doubles the cost and time** (two passes) and raises fact-drift risk, so check the `warnings` array: a `numbers may have changed` warning means a statistic moved and you should verify it.
 
 The response reports `strength`, `passes_run`, and `score_trajectory` (the internal score after each pass) so you can see whether the second pass actually helped.
+
+### HTML in, HTML out
+
+Your CMS sends `<p>` and `<h2>`, not Markdown. Send it as-is: `format` defaults to `auto`,
+HTML is detected by its block tags, converted to Markdown internally so headings are
+treated as headings rather than prose, and rendered back to HTML on the way out.
+
+```bash
+curl -s -X POST "$HUMANIZER_URL/humanize" \
+  -H "X-API-Key: $APP_API_KEY" \
+  -H "Content-Type: application/json" \
+  --max-time 600 \
+  -d '{
+    "text": "<p>First paragraph.</p>\n<h2>A Section</h2>\n<p>More body text.</p>",
+    "language": "en-US",
+    "strength": "max"
+  }'
+```
+
+The response reports `"format": "html"` and `content` comes back as HTML. `<pre>` and
+`<table>` blocks are frozen verbatim; `<script>` content is dropped.
+
+Two input problems the service now detects rather than silently mangling:
+
+- **Double-encoded newlines.** If the JSON was escaped twice, the text arrives containing
+  the two characters `\` and `n` instead of line breaks. These are converted, and a
+  warning says so. Prefer fixing it upstream with `JSON.stringify`.
+- **Duplicated body.** If your upstream node emits both a raw and a `rendered:` copy, you
+  will send the article twice: double cost, double time, and a repeated article in the
+  output. The service cannot tell that apart from a legitimately repetitive article, so
+  fix it in the node that builds the body.
 
 ### Override the model per call
 

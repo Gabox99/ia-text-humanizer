@@ -78,6 +78,35 @@ class HumanizeRequest(BaseModel):
             "extra pass compounds the rewrite and the cost, and raises fact-drift risk."
         ),
     )
+    adversarial: bool | None = Field(
+        None,
+        description=(
+            "Run the detector-guided adversarial pass after the rewrite. This is the "
+            "stage that optimises a real neural detector rather than the surface proxy, "
+            "and the only one that moves trained classifiers. Requires "
+            "GUIDANCE_DETECTOR=local to be meaningful. Defaults to ENABLE_ADVERSARIAL."
+        ),
+    )
+    adversarial_rounds: int | None = Field(
+        None, ge=1, le=8, description="Max substitution rounds in the adversarial pass."
+    )
+    adversarial_target: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Stop the adversarial pass once the guidance detector reports this "
+            "probability or lower (0.0-1.0). Default 0.25."
+        ),
+    )
+    format: Literal["auto", "markdown", "html"] | None = Field(
+        "auto",
+        description=(
+            "Input and output format. 'auto' detects HTML by its block tags and returns "
+            "the same format it received. HTML is converted to Markdown internally so "
+            "headings are treated as headings rather than prose, then rendered back."
+        ),
+    )
     rewrite_headings: bool = Field(
         True,
         description=(
@@ -153,6 +182,31 @@ class ChunkTrace(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class AdversarialReport(BaseModel):
+    """Outcome of the detector-guided pass.
+
+    `neural` is the field that matters: when it is false the numbers below come
+    from the stylometric proxy and say nothing about what GPTZero or Copyleaks
+    will report.
+    """
+
+    detector: str
+    neural: bool = Field(
+        ...,
+        description=(
+            "True when a real neural detector guided the pass. False means the "
+            "stylometric proxy was used and these probabilities are not detector scores."
+        ),
+    )
+    ai_probability_before: float
+    ai_probability_after: float
+    rounds_run: int
+    substitutions: int
+    trajectory: list[float] = Field(
+        default_factory=list, description="Detector probability after each round."
+    )
+
+
 class UsageReport(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
@@ -171,11 +225,13 @@ class HumanizeResponse(BaseModel):
     target_ai_score: float
     target_met: bool
     strength: str = "standard"
+    format: str = "markdown"
     passes_run: int = 1
     score_trajectory: list[float] = Field(
         default_factory=list,
         description="Composite ai_score after each pass, oldest first.",
     )
+    adversarial: AdversarialReport | None = None
     chunks: list[ChunkTrace]
     usage: UsageReport
     model: str
@@ -185,6 +241,35 @@ class HumanizeResponse(BaseModel):
 class AnalyzeRequest(BaseModel):
     text: str = Field(..., min_length=1)
     language: str = "en-US"
+
+
+class DetectRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    sentences: bool = Field(
+        True, description="Include per-sentence attribution, highest score first."
+    )
+    limit: int = Field(15, ge=1, le=200, description="How many sentences to return.")
+
+
+class DetectSentence(BaseModel):
+    ai_probability: float
+    text: str
+
+
+class DetectResponse(BaseModel):
+    detector: str
+    neural: bool = Field(
+        ...,
+        description=(
+            "True when a real neural detector answered. False means the stylometric "
+            "proxy answered and this is not a detector score."
+        ),
+    )
+    ai_probability: float = Field(..., description="0.0-1.0 for the whole document.")
+    ai_percent: float
+    verdict: str
+    words: int
+    sentences: list[DetectSentence] = Field(default_factory=list)
 
 
 class AnalyzeResponse(BaseModel):

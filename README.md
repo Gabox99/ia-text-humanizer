@@ -18,23 +18,60 @@ curl -X POST https://your-app.easypanel.host/humanize \
 
 ## Read this before you deploy it
 
-**No system can guarantee a specific score on a specific AI detector, and this one does
-not claim to.** That matters for how you use it, so here is the honest picture.
-
-AI detectors in 2026 stack three kinds of signal:
+AI detectors stack three kinds of signal:
 
 1. **Perplexity** — how predictable each word is to a reference language model.
 2. **Burstiness** — how much sentence-level predictability varies across the document.
-3. **Trained classifiers** — models fine-tuned to recognise the fingerprint that RLHF and
-   instruction-tuning leave in the weights, not just on the page.
+3. **Trained classifiers** — models fine-tuned on a learned decision boundary over token
+   distributions. GPTZero, Copyleaks, Originality.
 
-This service attacks (1) and (2) hard, and it attacks the *surface* of (3): the
-assistant register, the reflexive balance, the announced structure. Against
-perplexity-and-burstiness tools (ZeroGPT, QuillBot, most free checkers) rewritten text
-generally lands well under 10%. Against the strongest learned classifiers (Pangram, and
-GPTZero's newer models) surface rewriting has a real ceiling that no open-source approach
-clears reliably — the research consensus is that those detectors fire on artefacts a
-rewrite cannot fully remove.
+Rule-based rewriting handles (1) and (2) and stalls on (3). That is not a guess: an
+earlier version of this service produced prose that ZeroGPT scored at 26% and **GPTZero
+and Copyleaks both scored at 100% AI**. Optimising hand-picked surface features (em-dash
+density, banned vocabulary, sentence-length variance) can drive those features to a human
+distribution while a trained classifier does not move at all, because it was never
+reading those features.
+
+What closes the gap, per the literature, is optimising against a *real detector*:
+
+- **Adversarial Paraphrasing** ([arXiv:2506.07001](https://arxiv.org/abs/2506.07001)) —
+  score with a guidance detector, find the sentences carrying the machine signal,
+  generate paraphrase candidates, keep whichever most reduces the score. Evasion
+  **transfers to detectors never used during the attack**, because strong detectors
+  converge on a shared notion of "human" to keep their false-positive rate low.
+- **SICO** ([arXiv:2305.10847](https://arxiv.org/abs/2305.10847)) — greedy substitution
+  guided by a proxy detector. Reported to drop GPTZero AUC from 0.779 to 0.184.
+- **Recursive paraphrasing** ([arXiv:2303.11156](https://arxiv.org/abs/2303.11156)) —
+  repetition compounds the effect; gains decay per round.
+- **DIPPER** ([arXiv:2303.13408](https://arxiv.org/abs/2303.13408)) — the canonical
+  result that paraphrasing evades detectors, dropping DetectGPT from 70.3% to 4.6%.
+
+So this service runs a local neural detector and optimises against it. Measured on a real
+document, guidance detector probability went **0.7326 → 0.2347 in one round**, four
+sentence substitutions, one extra API call.
+
+**The one thing that decides whether this works for you:** the guidance detector has to
+*agree* with the detector that gates your publishing. Verify it, do not assume it:
+
+```bash
+python scripts/detector_check.py --file text_your_detector_flagged.md --expect ai
+```
+
+Measured on a pipeline output that GPTZero and Copyleaks both called 100% AI:
+
+| Guidance detector | p(AI) | Verdict |
+|---|---|---|
+| `desklib/ai-text-detector-v1.01` (default) | 0.76 | **agrees** — usable guide |
+| `fakespot-ai/roberta-base-ai-text-detection-v1` | 0.003 | disagrees — useless as a guide |
+
+A detector that already believes your text is human offers no gradient to climb. That
+is the whole reason `detector_check.py` exists.
+
+Two remaining limits, stated plainly. **The pipeline never invents facts** — it will not
+add a statistic or a quote to sound more lived-in, which caps how specific the output can
+get from a vague draft. And **no system can guarantee a number on a detector it cannot
+query**; treat every score here as evidence, and keep checking the detector that matters
+to you.
 
 So: **treat the `ai_score` in the response as a proxy, and validate against whichever
 detector actually gates your work.** The `/analyze` endpoint is free and unlimited — use
@@ -49,16 +86,22 @@ constraint, and it caps how "specific" the output can get from a vague draft.
 ## How it works
 
 ```
-mask code blocks + tables      frozen, never sent to the model
-  -> parse Markdown into blocks
-  -> chunk on heading boundaries (~700 words)
-  -> per chunk:
-       model rewrite (Claude, long style-rule system prompt, cached)
-       structural validation (heading tree, links, word count, frozen blocks)
-       deterministic regex clean-up (punctuation, tells, contractions)
-       stylometric score
-       if above target: retry with the failing signals as explicit instructions
-  -> reassemble -> restore frozen blocks -> lift the H1 into `title`
+detect format (HTML -> Markdown, unescape literal 
+)
+  -> mask code blocks + tables            frozen, never sent to the model
+  -> parse into blocks, chunk on headings (~700 words)
+  -> PASS 1..N (N from `strength`):
+       per chunk: model rewrite -> structural validation
+                  -> deterministic regex clean-up -> stylometric score
+                  -> if above target, retry with the failing signals as instructions
+       pass 2+ swaps the cleanup prompt for a texture prompt that adds human grain
+  -> ADVERSARIAL PASS (the part that moves trained classifiers):
+       score with the local neural guidance detector
+       rank sentences by attribution
+       generate paraphrase candidates for the worst ones (one API call)
+       score every candidate, greedily keep the best per sentence
+       verify at document level; roll back the round if it did not improve
+  -> restore frozen blocks -> lift the H1 into `title` -> render back to input format
 ```
 
 Three things make this different from pasting a "make it sound human" prompt into a chat
@@ -90,6 +133,27 @@ count, list item count, link URLs, frozen placeholders, word-count tolerance, an
 `preserve_terms` you passed. A rewrite that fails goes back with an explicit correction;
 if every attempt fails, the original section ships unchanged and you get a warning in the
 response rather than broken Markdown.
+
+### The adversarial pass is the one that matters
+
+Everything before it optimises a hand-crafted proxy. This stage optimises a real neural
+detector, and it has two properties worth knowing.
+
+**It cannot break your structure.** The pass only ever swaps one sentence for another
+*inside a paragraph or blockquote*. Headings, list items, tables and code are never
+touched. That is a property of the construction, not of a prompt instruction, so unlike a
+free rewrite there is no failure mode where the heading tree comes back mangled.
+
+**It rolls back.** Sentence-level gains do not always add up at document level, so each
+round is verified against the whole-document score and reverted if it did not improve.
+Accepting a worse document because the parts looked better is how these loops drift.
+
+Fact safety is enforced mechanically, not asked for: a candidate is rejected outright if
+it changes any number, drops a link, or drifts more than ~2x in length. That matters more
+here than in the rewrite passes, because sentence-level paraphrasing of a statistics-heavy
+article is exactly where a figure would quietly move.
+
+Cost is modest: one extra API call per round, typically one or two rounds.
 
 ### What the score measures
 
@@ -162,6 +226,10 @@ Only `text` is required.
 | `effort` | env `EFFORT` | `low`-`max` for this call. |
 | `strength` | env `STRENGTH` | `standard` \| `aggressive` \| `max`. Higher = harder edit; `max` adds a second texture pass. Helps most vs perplexity checkers; modest vs trained classifiers. |
 | `passes` | env `PASSES` | 1-3 full passes, overrides the count implied by `strength`. More passes = more cost and fact-drift risk. |
+| `format` | `auto` | `auto` \| `markdown` \| `html`. `auto` detects HTML by its block tags and returns the same format it received. |
+| `adversarial` | env | `false` skips the detector-guided pass. |
+| `adversarial_rounds` | env | 1-8 substitution rounds. |
+| `adversarial_target` | env | Stop once the guidance detector reports this probability (0.0-1.0). |
 | `target_ai_score` | env | Retry until the section is at or below this. |
 | `max_attempts` | env | Attempts per section, 1–6. |
 | `rewrite_headings` | `true` | `false` freezes heading lines exactly, for SEO-locked headings. |
@@ -269,11 +337,42 @@ Deploy, then verify:
 curl https://your-app.easypanel.host/health
 ```
 
-### Resources
+### Resources — this changed with the guidance detector
 
-The service holds no models in memory — all inference is the Anthropic API — so it is
-small: **512 MB RAM and 0.5 vCPU is comfortable.** The cheapest DigitalOcean droplet that
-runs EasyPanel itself is the real floor.
+The detector runs a 0.4B-parameter model in-process, which is a real commitment. Two
+deployment shapes, chosen with a Docker build arg:
+
+| | `WITH_DETECTOR=true` (default) | `WITH_DETECTOR=false` |
+|---|---|---|
+| Image | ~1.4 GB (~3 GB with the model baked in) | ~250 MB |
+| RAM | **~2 GB resident** | ~512 MB |
+| vCPU | 1-2 | 0.5 |
+| Detector scoring | ~1.5-2.5 s per pass | n/a |
+| Moves GPTZero / Copyleaks | yes, this is the point | **no** |
+
+**A 1 GB droplet will OOM with the detector enabled.** Size for 2 GB minimum; 4 GB if the
+droplet also runs EasyPanel and other apps, which it usually does.
+
+To build the lean image, set the build arg in EasyPanel (Build → Build args):
+
+```
+WITH_DETECTOR=false
+```
+
+and set `GUIDANCE_DETECTOR=none`. You keep the rewrite passes, the structural guarantees
+and the HTML round-trip, and you lose the only stage that moves trained classifiers.
+
+If RAM is tight but you want a neural guide, a roberta-base-class model needs ~900 MB
+instead of ~2 GB — but verify it agrees with your detector first, because the small ones
+frequently do not:
+
+```
+GUIDANCE_MODEL=fakespot-ai/roberta-base-ai-text-detection-v1
+```
+
+Set `GUIDANCE_WARMUP=true` so the ~40 s weight load happens at boot rather than being
+paid by whoever makes the first request. Give the EasyPanel health check a start period
+of at least 90 s to match.
 
 Timeouts are the thing to watch. A 2000-word article at `MAX_ATTEMPTS=3` can take 60–180
 seconds. If EasyPanel's proxy or your client cuts the connection first, raise the proxy
@@ -304,6 +403,17 @@ Every setting is an environment variable. See `.env.example` for the full annota
 | `MAX_ATTEMPTS` | `3` | Retry attempts per section. |
 | `STRENGTH` | `standard` | `standard` \| `aggressive` \| `max`. The main quality/cost dial. `max` runs two passes. |
 | `PASSES` | `0` | Full passes 1-3; `0` derives from `STRENGTH`. |
+| `GUIDANCE_DETECTOR` | `local` | `local` runs the neural detector (needs the detector image, ~2GB RAM). `none` uses the stylometric proxy and will **not** move trained classifiers. |
+| `GUIDANCE_MODEL` | `desklib/ai-text-detector-v1.01` | Must agree with your real detector — verify with `scripts/detector_check.py`. |
+| `GUIDANCE_BATCH_SIZE` | `16` | Candidate scoring batch. |
+| `GUIDANCE_THREADS` | `0` | `0` lets torch decide; set 1-2 on a small droplet. |
+| `GUIDANCE_WARMUP` | `false` | Load weights at boot (~40s) instead of on the first request. |
+| `ENABLE_ADVERSARIAL` | `true` | The detector-guided pass. |
+| `ADVERSARIAL_ROUNDS` | `3` | Max substitution rounds. |
+| `ADVERSARIAL_CANDIDATES` | `4` | Paraphrase candidates per sentence. |
+| `ADVERSARIAL_SENTENCES_PER_ROUND` | `12` | Sentences rewritten per round. |
+| `ADVERSARIAL_TARGET_PROBABILITY` | `0.25` | Stop once the detector is at or below this. |
+| `ADVERSARIAL_MIN_SENTENCE_PROBABILITY` | `0.35` | Substitution threshold per sentence. |
 | `CHUNK_TARGET_WORDS` | `700` | Smaller chunks buy attention per sentence; larger chunks buy rhythmic context. |
 | `CHUNK_MAX_WORDS` | `1000` | |
 | `ENABLE_POSTPROCESS` | `true` | |
@@ -335,6 +445,9 @@ Every setting is an environment variable. See `.env.example` for the full annota
 ```
 app/
   main.py               FastAPI routes and error mapping
+  adversarial.py        detector-guided sentence substitution (the attack)
+  detector/             guidance detector: interface, local neural model, fallback
+  html_bridge.py        HTML <-> Markdown round trip for CMS payloads
   config.py             env-var settings
   schemas.py            request/response contracts
   pipeline.py           orchestration: chunk, rewrite, validate, score, retry
@@ -346,6 +459,7 @@ app/
   rules/postprocess.py  deterministic regex clean-up
   scoring/metrics.py    stylometric measurement, scoring, retry feedback
 scripts/live_check.py   real end-to-end check with before/after report
+scripts/detector_check.py  verify a guidance detector agrees with your real one
 docs/n8n.md             curl examples and n8n HTTP Request node settings
 tests/                  offline tests with a stubbed model
 ```

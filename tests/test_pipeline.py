@@ -47,6 +47,7 @@ enterprises seeking to elevate their competitive positioning.
 """
 
 SECTION_RE = re.compile(r"<section>\n(.*?)\n</section>", re.DOTALL)
+SENTENCE_RE = re.compile(r"^(\d+)\. (.+)$", re.MULTILINE)
 
 
 class EchoRewriter:
@@ -67,11 +68,20 @@ class EchoRewriter:
             " ".join(b.get("text", "") for b in system_blocks) if system_blocks else ""
         )
         self.seen_messages.append(user_message)
-        section = SECTION_RE.search(user_message).group(1)
-        return Completion(
-            text=section,
-            usage=Usage(input_tokens=1000, output_tokens=500, api_calls=1),
-        )
+        usage = Usage(input_tokens=1000, output_tokens=500, api_calls=1)
+
+        # The adversarial pass uses a different prompt shape (numbered sentences
+        # in, [1a]/[1b] candidates out). Echo each sentence back so the loop runs
+        # its full mechanics and then finds no improvement.
+        section = SECTION_RE.search(user_message)
+        if section is None:
+            lines = [
+                f"[{m.group(1)}a] {m.group(2).strip()}"
+                for m in SENTENCE_RE.finditer(user_message)
+            ]
+            return Completion(text="\n".join(lines), usage=usage)
+
+        return Completion(text=section.group(1), usage=usage)
 
 
 class BreakingRewriter(EchoRewriter):
@@ -97,6 +107,8 @@ def _settings(**kw) -> Settings:
         chunk_max_words=120,
         target_ai_score=10.0,
         concurrency=2,
+        enable_adversarial=False,
+        guidance_detector="none",
     )
     base.update(kw)
     return Settings(**base)
@@ -276,6 +288,80 @@ def test_standard_still_single_pass_no_addendum():
     assert out.passes_run == 1
     assert not any("AGGRESSIVE MODE" in m for m in r.seen_messages)
     assert not any("final human pass" in s for s in r.seen_systems)
+
+
+def test_adversarial_pass_runs_and_reports():
+    r = EchoRewriter()
+    out = run(r, HumanizeRequest(text=ARTICLE, language="en-US"), enable_adversarial=True)
+    assert out.adversarial is not None
+    # With GUIDANCE_DETECTOR unset the pass falls back to the proxy, and the
+    # response must say so rather than let a proxy number pass for a detector one.
+    assert out.adversarial.neural is False
+    assert out.adversarial.detector == "stylometric-proxy"
+    assert any("stylometric proxy, not a neural detector" in w for w in out.warnings)
+    # Structure survives the extra pass.
+    assert "## Conclusion" in out.content
+    assert 'df = load("sales.csv")' in out.content
+    assert "https://example.com/report" in out.content
+
+
+def test_adversarial_can_be_disabled_per_request():
+    r = EchoRewriter()
+    out = run(
+        r,
+        HumanizeRequest(text=ARTICLE, language="en-US", adversarial=False),
+        enable_adversarial=True,
+    )
+    assert out.adversarial is None
+
+
+HTML_ARTICLE = (
+    "<p>In today's landscape, teams are leveraging robust frameworks that deliver "
+    "comprehensive outcomes for every stakeholder involved.</p>\\n"
+    "<h2>The Importance of a Holistic Approach</h2>\\n"
+    "<p>It is important to note that a holistic approach delivers significant "
+    'advantages. See <a href="https://example.com/report">the report</a> for detail.</p>\\n'
+    "<ul><li>Accuracy matters downstream</li><li>Scalability decides survival</li></ul>\\n"
+    "<h3>Did throughput reach 1200 units?</h3>\\n"
+    "<p>Yes, the warehouse moved 1200 units last quarter across all lines.</p>"
+)
+
+
+def test_html_in_html_out_with_structure_intact():
+    r = EchoRewriter()
+    out = run(r, HumanizeRequest(text=HTML_ARTICLE, language="en-US"))
+
+    assert out.format == "html", out.format
+    # Comes back as HTML, not Markdown.
+    assert "<p>" in out.content
+    assert "##" not in out.content and "**" not in out.content
+    # Heading levels preserved at the right depth.
+    assert "<h2>" in out.content and "<h3>" in out.content
+    # List and link survive the round trip.
+    assert out.content.count("<li>") == 2
+    assert 'href="https://example.com/report"' in out.content
+    # Facts survive.
+    assert "1200" in out.content
+    # The double-encoded newlines were detected and reported.
+    assert any("literal" in w for w in out.warnings)
+
+
+def test_markdown_input_still_returns_markdown():
+    r = EchoRewriter()
+    out = run(r, HumanizeRequest(text=ARTICLE, language="en-US"))
+    assert out.format == "markdown"
+    assert "<p>" not in out.content
+    assert "## Conclusion" in out.content
+
+
+def test_format_can_be_forced_to_markdown_on_html_input():
+    r = EchoRewriter()
+    out = run(
+        r, HumanizeRequest(text=HTML_ARTICLE, language="en-US", format="markdown")
+    )
+    assert out.format == "markdown"
+    # Forced Markdown mode leaves the tags as literal text rather than parsing them.
+    assert "<p>" in out.content
 
 
 def test_number_change_warns_but_does_not_reject():

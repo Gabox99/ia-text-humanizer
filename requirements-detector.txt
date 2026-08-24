@@ -1,0 +1,19 @@
+# Optional dependencies for the local neural guidance detector.
+#
+# This is what makes the adversarial pass able to move trained classifiers
+# (GPTZero, Copyleaks) instead of only surface-feature checkers. It is a real
+# resource commitment, so it is a separate file:
+#
+#   image size   +~1.1 GB (torch CPU) and +~1.6 GB if the model is baked in
+#   RAM          ~1.8-2.2 GB resident with desklib/ai-text-detector-v1.01
+#                ~0.9 GB with a roberta-base class model
+#   CPU          ~1.5-2.5 s per document scoring pass
+#
+# Install the CPU wheel explicitly; the default index pulls the CUDA build,
+# which is several gigabytes of driver code this service never uses:
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   pip install -r requirements-detector.txt
+torch>=2.4,<3
+transformers>=4.44,<6
+safetensors>=0.4
+huggingface-hub>=0.24
