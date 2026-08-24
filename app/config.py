@@ -38,6 +38,18 @@ class Settings(BaseSettings):
     target_ai_score: float = 10.0
     # Rewrite attempts per chunk before we accept the best result we have.
     max_attempts: int = 3
+    # Editing aggressiveness: standard | aggressive | max.
+    #   standard   - one structure-preserving rewrite pass.
+    #   aggressive - one pass, every section edited hard, extra human-texture
+    #                instructions, target lowered.
+    #   max        - aggressive plus a second "texture" pass that injects human
+    #                irregularity into the already-rewritten text.
+    # This helps most against perplexity/burstiness checkers; gains against
+    # trained classifiers (Copyleaks, TruthScan) are modest.
+    strength: str = "standard"
+    # Full pipeline passes. Overrides the count implied by `strength` when set.
+    # Capped at 3: more passes mostly add cost and fact-drift risk.
+    passes: int = 0  # 0 = derive from strength
     # Words per chunk sent to the model. Smaller chunks give the model more
     # attention per sentence; larger chunks give it more rhythmic context.
     chunk_target_words: int = 700

@@ -354,4 +354,32 @@ def validate_rewrite(
         issues.append(
             StructureIssue(kind="length", detail=f"word count {ow} -> {rw} is out of tolerance")
         )
+
+    # Numbers are facts. A humanizer must not change a stat, a year or a score.
+    # Reported as a warning (not a rejecting issue) because a legitimate rewrite
+    # may spell a number out ("9" -> "nine"), which would false-positive.
+    before_nums = _numbers(original)
+    after_nums = _numbers(rewritten)
+    dropped = before_nums - after_nums
+    added = after_nums - before_nums
+    if dropped or added:
+        bits = []
+        if dropped:
+            bits.append("dropped " + ", ".join(sorted(dropped)[:6]))
+        if added:
+            bits.append("introduced " + ", ".join(sorted(added)[:6]))
+        issues.append(StructureIssue(kind="numbers", detail="; ".join(bits)))
     return issues
+
+
+_NUMBER_RE = re.compile(r"\d[\d.,]*")
+
+
+def _numbers(text: str) -> set[str]:
+    """Numeric tokens, normalised so 9.39 and '9.39,' compare equal."""
+    out: set[str] = set()
+    for m in _NUMBER_RE.findall(text):
+        token = m.strip(".,").replace(",", "")
+        if token:
+            out.add(token)
+    return out

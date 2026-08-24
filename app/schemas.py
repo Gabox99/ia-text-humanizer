@@ -59,6 +59,25 @@ class HumanizeRequest(BaseModel):
     max_attempts: int | None = Field(
         None, ge=1, le=6, description="Override the rewrite attempts per chunk."
     )
+    strength: Literal["standard", "aggressive", "max"] | None = Field(
+        None,
+        description=(
+            "Editing aggressiveness. 'standard' = one structure-preserving pass. "
+            "'aggressive' = one hard pass with extra human-texture instructions and a "
+            "lower target. 'max' = aggressive plus a second texture pass. Higher "
+            "strength helps most against perplexity/burstiness checkers; gains against "
+            "trained classifiers are modest. Defaults to the STRENGTH env var."
+        ),
+    )
+    passes: int | None = Field(
+        None,
+        ge=1,
+        le=3,
+        description=(
+            "Full pipeline passes, overriding the count implied by `strength`. Each "
+            "extra pass compounds the rewrite and the cost, and raises fact-drift risk."
+        ),
+    )
     rewrite_headings: bool = Field(
         True,
         description=(
@@ -129,6 +148,9 @@ class ChunkTrace(BaseModel):
     ai_score_after: float
     accepted_attempt: int
     intensity: str
+    pass_: int = Field(0, alias="pass", serialization_alias="pass")
+
+    model_config = {"populate_by_name": True}
 
 
 class UsageReport(BaseModel):
@@ -148,6 +170,12 @@ class HumanizeResponse(BaseModel):
     metrics_before: MetricReport
     target_ai_score: float
     target_met: bool
+    strength: str = "standard"
+    passes_run: int = 1
+    score_trajectory: list[float] = Field(
+        default_factory=list,
+        description="Composite ai_score after each pass, oldest first.",
+    )
     chunks: list[ChunkTrace]
     usage: UsageReport
     model: str

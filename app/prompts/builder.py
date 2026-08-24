@@ -230,9 +230,14 @@ INTENSITY_PROFILES: dict[str, str] = {
 
 # Weighted so most sections get real work and only a minority stay light.
 _INTENSITY_WEIGHTS = ("heavy", "heavy", "moderate", "moderate", "moderate", "light", "surgical")
+# Aggressive strength drops "light"/"surgical" entirely: every section is
+# reworked, some harder than others, but none coasts.
+_INTENSITY_WEIGHTS_AGGRESSIVE = ("heavy", "heavy", "heavy", "moderate", "moderate")
 
 
-def pick_intensity(chunk_markdown: str, chunk_index: int, attempt: int) -> str:
+def pick_intensity(
+    chunk_markdown: str, chunk_index: int, attempt: int, strength: str = "standard"
+) -> str:
     """Deterministic per-chunk intensity, so runs are reproducible.
 
     Retries always escalate to "heavy": a chunk that failed its score target
@@ -240,8 +245,56 @@ def pick_intensity(chunk_markdown: str, chunk_index: int, attempt: int) -> str:
     """
     if attempt > 0:
         return "heavy"
+    weights = (
+        _INTENSITY_WEIGHTS_AGGRESSIVE if strength in {"aggressive", "max"} else _INTENSITY_WEIGHTS
+    )
     digest = hashlib.sha256(f"{chunk_index}:{chunk_markdown}".encode()).digest()
-    return _INTENSITY_WEIGHTS[digest[0] % len(_INTENSITY_WEIGHTS)]
+    return weights[digest[0] % len(weights)]
+
+
+# Appended for aggressive/max strength. This is where the effort goes against
+# trained classifiers: not more tell-removal (already done), but the small
+# irregularities that separate a person writing from a model producing.
+AGGRESSIVE_ADDENDUM = (
+    "AGGRESSIVE MODE. Beyond the standard edit, push the prose further from a clean, "
+    "even machine register:\n"
+    "- Vary sentence length more violently. A three-word sentence next to a thirty-word one.\n"
+    "- Start some sentences the way people actually do: with And, But, So, or mid-thought.\n"
+    "- Let one or two sentences be slightly loose or informal, the way a real draft is.\n"
+    "- Replace at least one predictable phrase per paragraph with a sharper, less obvious "
+    "choice, without inventing facts.\n"
+    "- Break the claim-evidence-restatement paragraph shape. Move the point around.\n"
+    "Do all of this UNEVENLY. Some paragraphs stay plainer than others. Uniform "
+    "irregularity is just another pattern."
+)
+
+# System prompt for the second (texture) pass. The tells are already gone by
+# then, so re-running the cleanup prompt would only sand the text flatter. This
+# pass does the opposite: it adds human grain.
+TEXTURE_CORE = (
+    "You are a writer doing a final human pass on prose that has already been edited once. "
+    "The obvious machine tells are gone. Your one job now is to make it read like a specific "
+    "person wrote it, not a very clean editor.\n\n"
+    "# Absolute constraints (unchanged)\n"
+    "Preserve every fact, number, name, date, quote and logical relationship exactly. "
+    "Preserve the structure exactly: same headings at the same levels, same paragraph count, "
+    "same list items, same Markdown syntax, same link URLs character for character. Never "
+    "touch a frozen placeholder like @@FROZEN-CODE-0@@. Stay in the input language. Keep the "
+    "length within about 10% of the input.\n\n"
+    "# What this pass does\n"
+    "Add grain, do not re-clean:\n"
+    "- Introduce natural unevenness in rhythm the previous pass may have smoothed out.\n"
+    "- Add the occasional aside, hedge that carries real doubt, or blunt short sentence.\n"
+    "- Let the voice show an attitude where the content supports one.\n"
+    "- Vary how paragraphs open and where their point lands.\n"
+    "- Swap any phrase that still sounds like default explainer prose for how a person would "
+    "actually say it.\n"
+    "Do NOT add facts. Do NOT add headings or lists. Do NOT make every paragraph quirky, that "
+    "is its own tell. Change less than you think, but change it where it counts.\n\n"
+    "# Output\n"
+    "Return the rewritten Markdown between " + REWRITE_OPEN + " and " + REWRITE_CLOSE + ". "
+    "Nothing before or after. No commentary."
+)
 
 
 def build_user_message(
@@ -256,11 +309,22 @@ def build_user_message(
     feedback: list[str] | None = None,
     attempt: int = 0,
     frozen_tokens: list[str] | None = None,
+    strength: str = "standard",
+    texture: bool = False,
 ) -> str:
     parts: list[str] = []
 
     parts.append(f"Language of the text: {language}")
-    parts.append(f"Editing strength for this section: {INTENSITY_PROFILES[intensity]}")
+
+    if texture:
+        parts.append(
+            "This section has already been humanized once. Do the texture pass described in "
+            "the system prompt: add human grain, do not re-clean, do not restructure."
+        )
+    else:
+        parts.append(f"Editing strength for this section: {INTENSITY_PROFILES[intensity]}")
+        if strength in {"aggressive", "max"}:
+            parts.append(AGGRESSIVE_ADDENDUM)
 
     if tone:
         parts.append(f"Voice to write in: {tone}")
@@ -316,10 +380,17 @@ def build_user_message(
     return "\n\n".join(parts)
 
 
-def build_system_blocks(pack: LanguagePack, language: str) -> list[dict]:
-    """System prompt as two cacheable blocks: core rules, then language pack."""
+def build_system_blocks(
+    pack: LanguagePack, language: str, texture: bool = False
+) -> list[dict]:
+    """System prompt as two cacheable blocks: core rules, then language pack.
+
+    The texture pass swaps the cleanup rules for the grain-adding rules but keeps
+    the same language block, so the vocabulary guidance still applies.
+    """
+    core = TEXTURE_CORE if texture else CORE_RULES
     return [
-        {"type": "text", "text": CORE_RULES, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": core, "cache_control": {"type": "ephemeral"}},
         {
             "type": "text",
             "text": language_block(pack, language),

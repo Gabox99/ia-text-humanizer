@@ -140,6 +140,8 @@ settings are in [docs/n8n.md](docs/n8n.md).
   "preserve_terms": ["Acme Cloud", "SOC 2"],
   "model": null,
   "effort": null,
+  "strength": "standard",
+  "passes": null,
   "target_ai_score": 10,
   "max_attempts": 3,
   "rewrite_headings": true,
@@ -158,6 +160,8 @@ Only `text` is required.
 | `preserve_terms` | `[]` | Must survive verbatim. A rewrite that drops one is rejected. |
 | `model` | env `MODEL` | Override the model for this call. Must be a `claude-*` id. Lets you A/B models without redeploying. |
 | `effort` | env `EFFORT` | `low`-`max` for this call. |
+| `strength` | env `STRENGTH` | `standard` \| `aggressive` \| `max`. Higher = harder edit; `max` adds a second texture pass. Helps most vs perplexity checkers; modest vs trained classifiers. |
+| `passes` | env `PASSES` | 1-3 full passes, overrides the count implied by `strength`. More passes = more cost and fact-drift risk. |
 | `target_ai_score` | env | Retry until the section is at or below this. |
 | `max_attempts` | env | Attempts per section, 1–6. |
 | `rewrite_headings` | `true` | `false` freezes heading lines exactly, for SEO-locked headings. |
@@ -297,7 +301,9 @@ Every setting is an environment variable. See `.env.example` for the full annota
 | `MAX_TOKENS` | `16000` | |
 | `ENABLE_REFUSAL_FALLBACK` | `true` | Server-side fallback if the model declines. Auto-disables itself if the account lacks the beta. |
 | `TARGET_AI_SCORE` | `10` | |
-| `MAX_ATTEMPTS` | `3` | The main quality/cost dial. |
+| `MAX_ATTEMPTS` | `3` | Retry attempts per section. |
+| `STRENGTH` | `standard` | `standard` \| `aggressive` \| `max`. The main quality/cost dial. `max` runs two passes. |
+| `PASSES` | `0` | Full passes 1-3; `0` derives from `STRENGTH`. |
 | `CHUNK_TARGET_WORDS` | `700` | Smaller chunks buy attention per sentence; larger chunks buy rhythmic context. |
 | `CHUNK_MAX_WORDS` | `1000` | |
 | `ENABLE_POSTPROCESS` | `true` | |

@@ -56,11 +56,17 @@ class EchoRewriter:
         self.calls = 0
         self.seen_models: list[str | None] = []
         self.seen_efforts: list[str | None] = []
+        self.seen_systems: list[str] = []
+        self.seen_messages: list[str] = []
 
     async def complete(self, system_blocks, user_message, model=None, effort=None):
         self.calls += 1
         self.seen_models.append(model)
         self.seen_efforts.append(effort)
+        self.seen_systems.append(
+            " ".join(b.get("text", "") for b in system_blocks) if system_blocks else ""
+        )
+        self.seen_messages.append(user_message)
         section = SECTION_RE.search(user_message).group(1)
         return Completion(
             text=section,
@@ -229,6 +235,66 @@ def test_generic_language_still_runs():
     out = run(r, HumanizeRequest(text=ARTICLE, language="de-DE"))
     assert out.title
     assert "## Conclusion" in out.content
+
+
+def test_strength_max_runs_two_passes_with_texture():
+    r = EchoRewriter()
+    out = run(r, HumanizeRequest(text=ARTICLE, language="en-US", strength="max"))
+    assert out.strength == "max"
+    assert out.passes_run == 2
+    assert len(out.score_trajectory) == 2
+    # Chunks are reported for the last pass, all tagged pass index 1.
+    assert all(getattr(c, "pass_", None) == 1 for c in out.chunks)
+    # The second pass used the texture system prompt; the first did not.
+    assert any("final human pass" in s for s in r.seen_systems), "texture prompt not used"
+    assert any("already been humanized once" in m for m in r.seen_messages)
+    # Structure still preserved after two passes.
+    assert "## Conclusion" in out.content
+    assert 'df = load("sales.csv")' in out.content
+
+
+def test_aggressive_single_pass_lowers_target_and_adds_addendum():
+    r = EchoRewriter()
+    out = run(r, HumanizeRequest(text=ARTICLE, language="en-US", strength="aggressive"))
+    assert out.strength == "aggressive"
+    assert out.passes_run == 1
+    assert out.target_ai_score <= 5.0, out.target_ai_score  # base 10 - 5
+    assert any("AGGRESSIVE MODE" in m for m in r.seen_messages)
+
+
+def test_explicit_passes_override_strength():
+    r = EchoRewriter()
+    out = run(r, HumanizeRequest(text=ARTICLE, language="en-US", strength="standard", passes=3))
+    assert out.passes_run == 3
+    assert len(out.score_trajectory) == 3
+
+
+def test_standard_still_single_pass_no_addendum():
+    r = EchoRewriter()
+    out = run(r, HumanizeRequest(text=ARTICLE, language="en-US"))
+    assert out.strength == "standard"
+    assert out.passes_run == 1
+    assert not any("AGGRESSIVE MODE" in m for m in r.seen_messages)
+    assert not any("final human pass" in s for s in r.seen_systems)
+
+
+def test_number_change_warns_but_does_not_reject():
+    # A rewriter that mangles a statistic should not be rejected (numbers may be
+    # spelled out legitimately) but must surface a spot-check warning.
+    class NumberBreaker(EchoRewriter):
+        async def complete(self, system_blocks, user_message, model=None, effort=None):
+            self.calls += 1
+            section = SECTION_RE.search(user_message).group(1)
+            return Completion(
+                text=section.replace("1200", "1500"),
+                usage=Usage(input_tokens=10, output_tokens=5, api_calls=1),
+            )
+
+    r = NumberBreaker()
+    art = "# T\n\nThe warehouse held 1200 units across the floor last year, in total.\n"
+    out = run(r, HumanizeRequest(text=art, language="en-US"))
+    assert any("numbers may have changed" in w for w in out.warnings), out.warnings
+    assert "1500" in out.content  # accepted despite the change
 
 
 if __name__ == "__main__":

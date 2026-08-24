@@ -93,6 +93,7 @@ class _Candidate:
     attempt: int
     intensity: str
     acceptable: bool
+    number_issue: str | None = None
 
 
 class Pipeline:
@@ -111,6 +112,9 @@ class Pipeline:
         mask: MaskResult,
         target: float,
         max_attempts: int,
+        strength: str = "standard",
+        texture: bool = False,
+        pass_index: int = 0,
     ) -> ChunkResult:
         original = chunk.markdown
         # Only the frozen tokens that actually occur in this chunk may be
@@ -131,7 +135,7 @@ class Pipeline:
 
         for attempt in range(max_attempts):
             attempts_made = attempt + 1
-            intensity = builder.pick_intensity(original, chunk.index, attempt)
+            intensity = builder.pick_intensity(original, chunk.index, attempt, strength)
             user_message = builder.build_user_message(
                 chunk_markdown=original,
                 language=req.language,
@@ -143,6 +147,8 @@ class Pipeline:
                 feedback=feedback or None,
                 attempt=attempt,
                 frozen_tokens=frozen,
+                strength=strength,
+                texture=texture,
             )
 
             try:
@@ -163,6 +169,7 @@ class Pipeline:
                 original, candidate_md, req.preserve_terms, mask=chunk_mask
             )
             serious = [i for i in issues if i.kind in SERIOUS_ISSUES]
+            number_issue = next((i for i in issues if i.kind == "numbers"), None)
 
             # A per-request flag wins over the env default in both directions.
             do_postprocess = (
@@ -186,6 +193,7 @@ class Pipeline:
                 attempt=attempt,
                 intensity=intensity,
                 acceptable=not serious,
+                number_issue=number_issue.detail if number_issue else None,
             )
             if best is None or _better(candidate, best):
                 best = candidate
@@ -225,6 +233,7 @@ class Pipeline:
                     ai_score_after=base_score.value,
                     accepted_attempt=-1,
                     intensity="none",
+                    pass_=pass_index,
                 ),
                 usage=usage,
                 warnings=warnings,
@@ -234,6 +243,13 @@ class Pipeline:
             warnings.append(
                 f"chunk {chunk.index}: best score {best.score} is above the target {target} "
                 f"after {attempts_made} attempt(s)."
+            )
+        if best.number_issue:
+            # Not a rejection — a number may have been spelled out legitimately —
+            # but a stat-heavy article deserves a spot-check pointer.
+            warnings.append(
+                f"chunk {chunk.index}: numbers may have changed ({best.number_issue}); "
+                "verify the facts in this section."
             )
 
         return ChunkResult(
@@ -247,6 +263,7 @@ class Pipeline:
                 ai_score_after=best.score,
                 accepted_attempt=best.attempt,
                 intensity=best.intensity,
+                pass_=pass_index,
             ),
             usage=usage,
             warnings=warnings,
@@ -254,9 +271,66 @@ class Pipeline:
 
     # --- whole document ---------------------------------------------------
 
+    async def _run_pass(
+        self,
+        source: str,
+        req: HumanizeRequest,
+        pack: metrics.LanguagePack,
+        target: float,
+        max_attempts: int,
+        strength: str,
+        texture: bool,
+        pass_index: int,
+    ) -> tuple[str, list[ChunkResult]]:
+        """One full mask -> chunk -> rewrite -> reassemble pass over the document."""
+        mask = mask_verbatim(source)
+        blocks = parse_blocks(mask.text)
+        if not blocks:
+            raise ValueError("no content found in `text`")
+
+        chunks = chunk_blocks(blocks, self.settings.chunk_target_words, self.settings.chunk_max_words)
+        system_blocks = builder.build_system_blocks(pack, req.language, texture=texture)
+
+        # The first chunk runs alone so it writes the prompt cache; the rest then
+        # read from it instead of each paying for the rule set.
+        results: list[ChunkResult] = []
+        if chunks:
+            results.append(
+                await self._rewrite_chunk(
+                    chunks[0], req, pack, system_blocks, mask, target, max_attempts,
+                    strength=strength, texture=texture, pass_index=pass_index,
+                )
+            )
+        if len(chunks) > 1:
+            sem = asyncio.Semaphore(max(1, self.settings.concurrency))
+
+            async def guarded(c: Chunk) -> ChunkResult:
+                async with sem:
+                    return await self._rewrite_chunk(
+                        c, req, pack, system_blocks, mask, target, max_attempts,
+                        strength=strength, texture=texture, pass_index=pass_index,
+                    )
+
+            results.extend(await asyncio.gather(*(guarded(c) for c in chunks[1:])))
+
+        results.sort(key=lambda r: r.chunk.index)
+        rebuilt = "\n\n".join(r.markdown.strip() for r in results if r.markdown.strip())
+        rebuilt = mask.restore(rebuilt)
+        return rebuilt, results
+
     async def run(self, req: HumanizeRequest) -> HumanizeResponse:
         settings = self.settings
-        target = req.target_ai_score if req.target_ai_score is not None else settings.target_ai_score
+        strength = (req.strength or settings.strength or "standard").lower()
+        if strength not in {"standard", "aggressive", "max"}:
+            strength = "standard"
+        passes = self._resolve_passes(req, strength)
+
+        base_target = (
+            req.target_ai_score if req.target_ai_score is not None else settings.target_ai_score
+        )
+        # Aggressive/max push the proxy target lower, which makes the retry loop
+        # try harder. Floored so it stays reachable.
+        target = max(3.0, base_target - 5.0) if strength in {"aggressive", "max"} else base_target
         max_attempts = req.max_attempts or settings.max_attempts
         model = req.model or settings.model
         pack = metrics.pack_for(req.language)
@@ -272,42 +346,30 @@ class Pipeline:
                 source = f"# {req.title.strip()}\n\n{source}"
                 injected_title = True
 
-        mask = mask_verbatim(source)
-        blocks = parse_blocks(mask.text)
-        if not blocks:
-            raise ValueError("no content found in `text`")
-
-        measured_before, score_before, _ = metrics.analyse(mask.text, req.language)
-        chunks = chunk_blocks(blocks, settings.chunk_target_words, settings.chunk_max_words)
-        system_blocks = builder.build_system_blocks(pack, req.language)
-
-        # The first chunk runs alone so it writes the prompt cache; the rest
-        # then read from it instead of each paying for the rule set.
-        results: list[ChunkResult] = []
-        if chunks:
-            results.append(
-                await self._rewrite_chunk(
-                    chunks[0], req, pack, system_blocks, mask, target, max_attempts
-                )
-            )
-        if len(chunks) > 1:
-            sem = asyncio.Semaphore(max(1, settings.concurrency))
-
-            async def guarded(c: Chunk) -> ChunkResult:
-                async with sem:
-                    return await self._rewrite_chunk(
-                        c, req, pack, system_blocks, mask, target, max_attempts
-                    )
-
-            results.extend(await asyncio.gather(*(guarded(c) for c in chunks[1:])))
-
-        results.sort(key=lambda r: r.chunk.index)
+        measured_before, score_before, _ = metrics.analyse(
+            mask_verbatim(source).text, req.language
+        )
 
         usage = Usage()
         warnings: list[str] = []
-        for r in results:
-            usage.add(r.usage)
-            warnings.extend(r.warnings)
+        trajectory: list[float] = []
+        last_results: list[ChunkResult] = []
+        current = source
+
+        for p in range(passes):
+            # The first pass cleans; later passes add human texture rather than
+            # sand the text flatter by re-running the cleanup prompt.
+            texture = p > 0
+            current, results = await self._run_pass(
+                current, req, pack, target, max_attempts,
+                strength=strength, texture=texture, pass_index=p,
+            )
+            last_results = results
+            for r in results:
+                usage.add(r.usage)
+                warnings.extend(r.warnings)
+            _, pass_score, _ = metrics.analyse(mask_verbatim(current).text, req.language)
+            trajectory.append(pass_score.value)
 
         if model not in PRICING:
             warnings.append(
@@ -315,11 +377,7 @@ class Pipeline:
                 "Opus rates and may be wrong."
             )
 
-        rebuilt = "\n\n".join(r.markdown.strip() for r in results if r.markdown.strip())
-        rebuilt = mask.restore(rebuilt)
-
-        title, content = self._split_title(rebuilt, req, injected_title)
-
+        title, content = self._split_title(current, req, injected_title)
         measured_after, score_after, _ = metrics.analyse(content, req.language)
 
         return HumanizeResponse(
@@ -330,7 +388,10 @@ class Pipeline:
             metrics_before=to_report(measured_before, score_before),
             target_ai_score=target,
             target_met=score_after.value <= target,
-            chunks=[r.trace for r in results],
+            strength=strength,
+            passes_run=passes,
+            score_trajectory=[round(v, 2) for v in trajectory],
+            chunks=[r.trace for r in last_results],
             usage=UsageReport(
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
@@ -342,6 +403,14 @@ class Pipeline:
             model=model,
             warnings=warnings,
         )
+
+    def _resolve_passes(self, req: HumanizeRequest, strength: str) -> int:
+        """How many full passes to run. Explicit request wins, else per strength."""
+        if req.passes:
+            return max(1, min(3, req.passes))
+        if self.settings.passes:
+            return max(1, min(3, self.settings.passes))
+        return 2 if strength == "max" else 1
 
     def _split_title(
         self, rebuilt: str, req: HumanizeRequest, injected_title: bool

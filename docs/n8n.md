@@ -141,6 +141,30 @@ print('written     article.humanized.md')
 "
 ```
 
+### Push harder against detectors (`strength`)
+
+```bash
+curl -s -X POST "$HUMANIZER_URL/humanize" \
+  -H "X-API-Key: $APP_API_KEY" \
+  -H "Content-Type: application/json" \
+  --max-time 600 \
+  -d '{
+    "text": "# Title\n\nBody...",
+    "language": "en-US",
+    "strength": "max"
+  }'
+```
+
+`strength` is the aggressiveness dial:
+
+- `standard` (default) — one structure-preserving pass.
+- `aggressive` — one hard pass, every section reworked, extra human-texture instructions, lower target.
+- `max` — aggressive plus a second pass that injects human irregularity into the already-rewritten text.
+
+**Honest expectation:** higher strength helps most against perplexity/burstiness checkers (ZeroGPT, QuillBot). Against trained classifiers (Copyleaks, and TruthScan/Undetectable) the gain is modest — those detect a model fingerprint that surface rewriting cannot fully remove. `max` also **doubles the cost and time** (two passes) and raises fact-drift risk, so check the `warnings` array: a `numbers may have changed` warning means a statistic moved and you should verify it.
+
+The response reports `strength`, `passes_run`, and `score_trajectory` (the internal score after each pass) so you can see whether the second pass actually helped.
+
 ### Override the model per call
 
 Handy for A/B testing without redeploying. Must be a `claude-*` id.
